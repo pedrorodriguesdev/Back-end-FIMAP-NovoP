@@ -86,7 +86,7 @@ export default {
 
     const mensagens = rotaChatPublico ? [{ role: "system", content: systemPrompt }, ...body.messages] : body.messages;
     try {
-      const stream = await env.AI.run("@cf/zai-org/glm-4.7-flash", { messages: mensagens as Array<{ role: "system" | "user" | "assistant"; content: string }>, stream: true });
+      const stream = await env.AI.run("@cf/zai-org/glm-4.7-flash", { messages: mensagens as Array<{ role: "system" | "user" | "assistant"; content: string }>, stream: true, chat_template_kwargs: { enable_thinking: false } });
       if (rotaLegada) return new Response(stream as ReadableStream, { headers: { ...corsHeaders, "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform" } });
       return new Response(criarFluxoDoChat(stream as ReadableStream, new TextEncoder()), { headers: { ...corsHeaders, "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache, no-transform", "X-Content-Type-Options": "nosniff" } });
     } catch (error) {
@@ -95,4 +95,5 @@ export default {
     }
   },
 } satisfies ExportedHandler<Env>;
+
 
