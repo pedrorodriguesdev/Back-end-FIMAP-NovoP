@@ -1,247 +1,75 @@
-// const knex = require('knex')
-// const knexConfig = require('../../Database_config_knex/KnexFile.js')
+/*
+ * PARA QUE SERVE: Cuida do histórico: lê mensagens, grava a pergunta, chama a IA e salva a resposta concluída.
+ * QUANDO ENTRA EM AÇÃO: Entra nas conversas que pertencem a um chat salvo no MySQL.
+ * QUANDO FAZ DIFERENÇA: Faz diferença para a IA receber contexto e para respostas interrompidas não serem salvas como concluídas.
+ */
 
-// const db = knex(knexConfig.development)
-// const PAPEL_USUARIO = 1
-// const PAPEL_ASSISTENTE = 2
-// const TIMEOUT_IA_MS = 180000
+const db = require('../../Database_config_knex/connection.js')
+const chatDAO = require('../Chat/ChatDAO.js')
+const ia = require('../../../src/services/aiChatService.js')
+const { criarErro, validarMensagens } = require('../../../src/services/chatValidation.js')
 
-// const erro = (statusCode, message, code) => {
-//     const error = new Error(message)
-//     error.statusCode = statusCode
-//     if (code) error.code = code
-//     return error
-// }
+const PAPEL_USUARIO = 1
+const PAPEL_ASSISTENTE = 2
+// Evita duas respostas ao mesmo tempo para o mesmo chat neste processo.
+const emAndamento = new Set()
+const formatarMensagem = (mensagem) => ({
+    id: mensagem.id,
+    chat_id: mensagem.id_chat,
+    papel: Number(mensagem.papel) === PAPEL_USUARIO ? 'usuario' : 'assistente',
+    conteudo: mensagem.conteudo,
+    data_envio: mensagem.data_envio
+})
+const buscarChat = (chatId) => chatDAO.GetChatById(chatId)
 
-// const formatarMensagem = (mensagem) => ({
-//     id: mensagem.id,
-//     chat_id: mensagem.id_chat,
-//     papel: Number(mensagem.papel) === PAPEL_USUARIO ? 'usuario' : 'assistente',
-//     conteudo: mensagem.conteudo,
-//     data_envio: mensagem.data_envio
-// })
+// Lê uma página do histórico; o cursor permite buscar mensagens mais antigas.
+const listarMensagensChat = async (chatId, { antesDe, limite = 30 } = {}) => {
+    if (!await buscarChat(chatId)) return null
+    let consulta = db('tbl_mensagem').select('id', 'conteudo', 'data_envio', 'papel', 'id_chat').where('id_chat', chatId)
+    if (antesDe !== undefined) consulta = consulta.where('id', '<', antesDe)
+    const linhas = await consulta.orderBy('id', 'desc').limit(limite + 1)
+    const temMais = linhas.length > limite
+    const mensagens = linhas.slice(0, limite).reverse().map(formatarMensagem)
+    return { mensagens, tem_mais: temMais, proximo_cursor: temMais && mensagens.length ? mensagens[0].id : null }
+}
 
-// const buscarChat = async (chatId) =>
-//     db('tbl_chat').select('id', 'nome', 'id_usuario').where({ id: chatId }).first()
+// Converte a mensagem salva no banco para o formato que o frontend recebe.
+const gravarMensagem = async (chatId, conteudo, papel) => {
+    const linha = { id_chat: chatId, conteudo, papel, data_envio: new Date() }
+    const [id] = await db('tbl_mensagem').insert(linha)
+    return formatarMensagem({ ...linha, id })
+}
 
-// const listarMensagensChat = async (chatId, { antesDe, limite = 30 } = {}) => {
-//     const chat = await buscarChat(chatId)
-//     if (!chat) return null
+const iniciarMensagemChat = async (chatId, conteudo, aoReceberTrecho, signal) => {
+    const [pergunta] = validarMensagens([{ role: 'user', content: conteudo }])
+    ia.obterConfiguracao()
+    signal?.throwIfAborted()
+    if (emAndamento.has(chatId))
+        throw criarErro(409, 'Já existe uma resposta sendo gerada para este chat.', 'CHAT_EM_ANDAMENTO')
+    emAndamento.add(chatId)
+    try {
+        if (!await buscarChat(chatId)) return null
+        signal?.throwIfAborted()
+        const historico = await db('tbl_mensagem').select('papel', 'conteudo')
+            .where('id_chat', chatId).orderBy('id', 'desc').limit(10)
+        const mensagens = [...historico.reverse().map((item) => ({
+            role: Number(item.papel) === PAPEL_USUARIO ? 'user' : 'assistant',
+            content: item.conteudo
+        })), pergunta]
+        // Valida todo o contexto antes de gravar a pergunta ou chamar o provedor.
+        validarMensagens(mensagens)
+        signal?.throwIfAborted()
+        // A pergunta fica no histórico mesmo se a IA falhar depois.
+        const mensagemUsuario = await gravarMensagem(chatId, pergunta.content, PAPEL_USUARIO)
+        signal?.throwIfAborted()
+        const texto = await ia.gerarResposta(mensagens, aoReceberTrecho, signal)
+        signal?.throwIfAborted()
+        // Só chega aqui depois de a IA concluir; pedaços interrompidos não são salvos.
+        const mensagemAssistente = await gravarMensagem(chatId, texto, PAPEL_ASSISTENTE)
+        return { mensagem_usuario: mensagemUsuario, mensagem_assistente: mensagemAssistente }
+    } finally {
+        emAndamento.delete(chatId)
+    }
+}
 
-//     let consulta = db('tbl_mensagem')
-//         .select('id', 'conteudo', 'data_envio', 'papel', 'id_chat')
-//         .where('id_chat', chatId)
-
-//     if (antesDe !== undefined) consulta = consulta.where('id', '<', antesDe)
-
-//     const linhas = await consulta.orderBy('id', 'desc').limit(limite + 1)
-//     const temMais = linhas.length > limite
-//     const mensagens = linhas.slice(0, limite).reverse().map(formatarMensagem)
-
-//     return {
-//         mensagens,
-//         tem_mais: temMais,
-//         proximo_cursor: temMais && mensagens.length ? mensagens[0].id : null
-//     }
-// }
-
-// const extrairTrechoCloudflare = (dados) => {
-//     if (typeof dados === 'string') return dados
-//     return (
-//         dados?.response ||
-//         dados?.choices?.[0]?.delta?.content ||
-//         dados?.choices?.[0]?.message?.content ||
-//         ''
-//     )
-// }
-
-// const transmitirRespostaAssistente = async (chatId, conteudo, idUsuario, aoReceberTrecho, signal) => {
-//     const respostaLugares = await geoapifyPlacesService.respostaLugares(conteudo)
-//     if (respostaLugares) {
-//         aoReceberTrecho(respostaLugares)
-//         signal?.throwIfAborted()
-//         const [idAssistente] = await db('tbl_mensagem').insert({
-//             conteudo: respostaLugares,
-//             data_envio: new Date(),
-//             papel: PAPEL_ASSISTENTE,
-//             id_chat: chatId
-//         })
-//         const linha = await db('tbl_mensagem')
-//             .select('id', 'conteudo', 'data_envio', 'papel', 'id_chat')
-//             .where({ id: idAssistente })
-//             .first()
-//         return formatarMensagem(linha)
-//     }
-
-//     const workerUrl = process.env.CLOUDFLARE_WORKER_URL || WORKER_URL_PADRAO
-//     const token = process.env.CLOUDFLARE_CHAT_TOKEN
-//     if (!token)
-//         throw erro(503, 'Configure CLOUDFLARE_CHAT_TOKEN no .env.', 'CLOUDFLARE_NOT_CONFIGURED')
-
-//     const historico = await db('tbl_mensagem')
-//         .select('papel', 'conteudo')
-//         .where({ id_chat: chatId })
-//         .where('id', '<', idUsuario)
-//         .orderBy('id', 'desc')
-//         .limit(10)
-
-//     const mensagens = [
-//         {
-//             role: 'system',
-//             content: systemPrompt
-//         }
-//     ]
-//     mensagens.push(
-//         ...historico.reverse().map((mensagem) => ({
-//             role: Number(mensagem.papel) === PAPEL_USUARIO ? 'user' : 'assistant',
-//             content: mensagem.conteudo
-//         }))
-//     )
-//     mensagens.push({ role: 'user', content: conteudo })
-
-//     let response
-//     try {
-//         response = await fetch(workerUrl, {
-//             method: 'POST',
-//             headers: {
-//                 'Content-Type': 'application/json',
-//                 Authorization: `Bearer ${token}`
-//             },
-//             body: JSON.stringify({ messages: mensagens }),
-//             signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_IA_MS)]) : AbortSignal.timeout(TIMEOUT_IA_MS)
-//         })
-//     } catch (cause) {
-//         signal?.throwIfAborted()
-//         if (cause.name === 'TimeoutError' || cause.name === 'AbortError') {
-//             throw erro(503, 'A Cloudflare excedeu o tempo limite.', 'CLOUDFLARE_TIMEOUT')
-//         }
-//         throw erro(
-//             503,
-//             'Não foi possível conectar ao Worker da Cloudflare.',
-//             'CLOUDFLARE_UNAVAILABLE'
-//         )
-//     }
-
-//     if (!response.ok) {
-//         const corpoErro = await response.text().catch(() => '')
-//         let mensagemErro = `O Worker da Cloudflare respondeu com status ${response.status}.`
-//         try {
-//             mensagemErro = JSON.parse(corpoErro).error || mensagemErro
-//         } catch {}
-//         if (response.status === 401) throw erro(503, mensagemErro, 'CLOUDFLARE_AUTH_ERROR')
-//         if (response.status === 404) throw erro(503, mensagemErro, 'CLOUDFLARE_URL_ERROR')
-//         throw erro(502, mensagemErro, 'CLOUDFLARE_PROVIDER_ERROR')
-//     }
-//     if (!response.body)
-//         throw erro(
-//             502,
-//             'A Cloudflare não retornou um fluxo de resposta.',
-//             'CLOUDFLARE_INVALID_RESPONSE'
-//         )
-
-//     let respostaCompleta = ''
-//     const reader = response.body.getReader()
-//     const decoder = new TextDecoder()
-//     let buffer = ''
-//     try {
-//         while (true) {
-//             const { value, done } = await reader.read()
-//             buffer += decoder.decode(value || new Uint8Array(), { stream: !done })
-//             const eventos = buffer.split(/\r?\n\r?\n/)
-//             buffer = eventos.pop() || ''
-
-//             for (const evento of eventos) {
-//                 const dadosEvento = evento
-//                     .split(/\r?\n/)
-//                     .filter((linha) => linha.startsWith('data:'))
-//                     .map((linha) => linha.slice(5).trim())
-//                     .join('\n')
-//                 if (!dadosEvento || dadosEvento === '[DONE]') continue
-//                 let dados
-//                 try {
-//                     dados = JSON.parse(dadosEvento)
-//                 } catch {
-//                     dados = dadosEvento
-//                 }
-//                 const trecho = extrairTrechoCloudflare(dados)
-//                 if (trecho) {
-//                     respostaCompleta += trecho
-//                     aoReceberTrecho(trecho)
-//                 }
-//             }
-//             if (done) break
-//         }
-//         if (buffer.trim()) {
-//             const dadosEvento = buffer
-//                 .split(/\r?\n/)
-//                 .filter((linha) => linha.startsWith('data:'))
-//                 .map((linha) => linha.slice(5).trim())
-//                 .join('\n')
-//             if (dadosEvento && dadosEvento !== '[DONE]') {
-//                 let dados
-//                 try {
-//                     dados = JSON.parse(dadosEvento)
-//                 } catch {
-//                     dados = dadosEvento
-//                 }
-//                 const trecho = extrairTrechoCloudflare(dados)
-//                 if (trecho) {
-//                     respostaCompleta += trecho
-//                     aoReceberTrecho(trecho)
-//                 }
-//             }
-//         }
-//     } catch (cause) {
-//         signal?.throwIfAborted()
-//         if (cause.code) throw cause
-//         throw erro(
-//             502,
-//             'O fluxo de resposta da Cloudflare era inválido.',
-//             'CLOUDFLARE_INVALID_RESPONSE'
-//         )
-//     }
-
-//     respostaCompleta = respostaCompleta.trim()
-//     if (!respostaCompleta)
-//         throw erro(502, 'A Cloudflare retornou uma resposta vazia.', 'CLOUDFLARE_INVALID_RESPONSE')
-
-//     signal?.throwIfAborted()
-//     const [idAssistente] = await db('tbl_mensagem').insert({
-//         conteudo: respostaCompleta,
-//         data_envio: new Date(),
-//         papel: PAPEL_ASSISTENTE,
-//         id_chat: chatId
-//     })
-//     const linha = await db('tbl_mensagem')
-//         .select('id', 'conteudo', 'data_envio', 'papel', 'id_chat')
-//         .where({ id: idAssistente })
-//         .first()
-//     return formatarMensagem(linha)
-// }
-
-// const iniciarMensagemChat = async (chatId, conteudo, aoReceberTrecho, signal) => {
-//     const chat = await buscarChat(chatId)
-//     if (!chat) return null
-
-//     const [idUsuario] = await db('tbl_mensagem').insert({
-//         conteudo,
-//         data_envio: new Date(),
-//         papel: PAPEL_USUARIO,
-//         id_chat: chatId
-//     })
-//     const linhaUsuario = await db('tbl_mensagem')
-//         .select('id', 'conteudo', 'data_envio', 'papel', 'id_chat')
-//         .where({ id: idUsuario })
-//         .first()
-//     const mensagemUsuario = formatarMensagem(linhaUsuario)
-//     const mensagemAssistente = await transmitirRespostaAssistente(
-//         chatId,
-//         conteudo,
-//         idUsuario,
-//         aoReceberTrecho,
-//         signal
-//     )
-//     return { mensagem_usuario: mensagemUsuario, mensagem_assistente: mensagemAssistente }
-// }
-
-// module.exports = { listarMensagensChat, iniciarMensagemChat }
+module.exports = { buscarChat, listarMensagensChat, iniciarMensagemChat }

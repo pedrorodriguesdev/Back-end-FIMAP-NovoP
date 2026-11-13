@@ -1,92 +1,43 @@
-const configMensagens = require('../modulo/configMensagens.js')
-const mensagemChatDAO = require('../../../model/DAO/MensagemChat/MensagemChatDAO.js')
+/*
+ * PARA QUE SERVE: Recebe perguntas e consultas de histórico de um chat salvo.
+ * QUANDO ENTRA EM AÇÃO: Entra nas rotas de mensagens que possuem um chatId.
+ * QUANDO FAZ DIFERENÇA: Faz diferença para validar a entrada, conferir se o chat existe e devolver os eventos da resposta.
+ */
 
-const resposta = (res, status, dados) => res.status(status).json(dados)
-const validarId = (valor) => {
-    const id = Number(valor)
-    return Number.isInteger(id) && id > 0 ? id : null
-}
+const config = require('../modulo/configMensagens.js')
+const dao = require('../../../model/DAO/MensagemChat/MensagemChatDAO.js')
+const ia = require('../../services/aiChatService.js')
+const { criarErro, validarId, validarMensagens } = require('../../services/chatValidation.js')
+const { transmitir, responderErro } = require('../../services/chatStream.js')
 
+// GET: busca mensagens já salvas; não pede uma resposta nova à IA.
 const listarMensagensChat = async (req, res) => {
     const chatId = validarId(req.params.chatId)
     const antesDe = req.query.antes_de === undefined ? undefined : validarId(req.query.antes_de)
-    const limite = req.query.limite === undefined ? 30 : Number(req.query.limite)
-    if (
-        !chatId ||
-        (req.query.antes_de !== undefined && !antesDe) ||
-        !Number.isInteger(limite) ||
-        limite < 1 ||
-        limite > 100
-    ) {
-        return resposta(res, 400, configMensagens.ERROR_BAD_REQUEST)
-    }
+    const limite = req.query.limite === undefined ? 30 : validarId(req.query.limite)
+    if (!chatId || (req.query.antes_de !== undefined && !antesDe) || !limite || limite > 100)
+        return res.status(400).json(config.ERROR_BAD_REQUEST)
     try {
-        const pagina = await mensagemChatDAO.listarMensagensChat(chatId, { antesDe, limite })
-        if (!pagina) return resposta(res, 404, configMensagens.ERROR_CHAT_NOT_FOUND)
-        return resposta(res, 200, pagina)
-    } catch (error) {
-        console.error('Erro ao listar mensagens do chat:', error)
-        return resposta(res, 500, configMensagens.ERROR_INTERNAL_SERVER)
-    }
+        const pagina = await dao.listarMensagensChat(chatId, { antesDe, limite })
+        if (!pagina) return res.status(404).json(config.ERROR_CHAT_NOT_FOUND)
+        return res.status(200).json(pagina)
+    } catch (error) { return responderErro(res, error) }
 }
 
+// POST: recebe a pergunta, confere o chat e inicia o fluxo com histórico.
 const enviarMensagemChat = async (req, res) => {
     const chatId = validarId(req.params.chatId)
-    const conteudo = typeof req.body?.conteudo === 'string' ? req.body.conteudo.trim() : ''
-    if (!chatId) return resposta(res, 400, configMensagens.ERROR_BAD_REQUEST)
-    if (!conteudo || conteudo.length > 4000)
-        return resposta(res, 400, configMensagens.ERROR_INVALID_MESSAGE)
-
-    res.status(200)
-    res.set({
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no'
-    })
-    res.flushHeaders()
-    const controlador = new AbortController()
-    const cancelar = () => { if (!res.writableEnded) controlador.abort() }
-    res.on('close', cancelar)
-    const evento = (dados) => !res.destroyed && !res.writableEnded && res.write(`data: ${JSON.stringify(dados)}\n\n`)
+    if (!chatId) return res.status(400).json(config.ERROR_BAD_REQUEST)
     try {
-        const resultado = await mensagemChatDAO.iniciarMensagemChat(chatId, conteudo, (trecho) =>
-            evento({ tipo: 'trecho', conteudo: trecho }), controlador.signal
-        )
-        if (!resultado)
-            evento({
-                tipo: 'erro',
-                mensagem: configMensagens.ERROR_CHAT_NOT_FOUND.mensagem || 'Chat não encontrado.'
-            })
-        else
-            evento({
-                tipo: 'fim',
-                mensagem_usuario: resultado.mensagem_usuario,
-                mensagem_assistente: resultado.mensagem_assistente
-            })
-    } catch (error) {
-        if (controlador.signal.aborted) return
-        console.error('Erro ao enviar mensagem para a Cloudflare:', error)
-        const mensagens = {
-            CLOUDFLARE_NOT_CONFIGURED: 'Configure CLOUDFLARE_CHAT_TOKEN no arquivo .env.',
-            CLOUDFLARE_AUTH_ERROR:
-                'O token do backend não corresponde ao token configurado no Worker.',
-            CLOUDFLARE_URL_ERROR:
-                'Confira CLOUDFLARE_WORKER_URL; use a URL do Worker terminada em /chat.',
-            CLOUDFLARE_TIMEOUT: 'A Cloudflare demorou demais para responder. Tente novamente.',
-            CLOUDFLARE_UNAVAILABLE: 'Não foi possível conectar ao Worker da Cloudflare.',
-            CLOUDFLARE_PROVIDER_ERROR: error.message,
-            CLOUDFLARE_INVALID_RESPONSE: error.message
-        }
-        evento({
-            tipo: 'erro',
-            mensagem:
-                mensagens[error.code] || error.message || 'Não foi possível obter resposta da IA.'
+        const [pergunta] = validarMensagens([{ role: 'user', content: req.body?.conteudo }])
+        ia.obterConfiguracao()
+        if (!await dao.buscarChat(chatId)) return res.status(404).json(config.ERROR_CHAT_NOT_FOUND)
+        return await transmitir(res, async (aoReceberTrecho, signal) => {
+            const resultado = await dao.iniciarMensagemChat(chatId, pergunta.content, aoReceberTrecho, signal)
+            if (!resultado) throw criarErro(404, 'Chat não encontrado.', 'CHAT_NAO_ENCONTRADO')
+            return resultado
         })
-    } finally {
-        res.off('close', cancelar)
-        res.end()
-    }
+    } catch (error) { return responderErro(res, error) }
 }
 
 module.exports = { listarMensagensChat, enviarMensagemChat }

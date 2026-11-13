@@ -1,14 +1,22 @@
+/*
+ * PARA QUE SERVE: Recebe os pedidos de criar, listar, renomear e apagar chats.
+ * QUANDO ENTRA EM AÇÃO: Entra quando uma rota administrativa de chat é acessada.
+ * QUANDO FAZ DIFERENÇA: Faz diferença para validar os dados e escolher a resposta HTTP antes ou depois do DAO.
+ */
+
 const config_message = require('../modulo/configMensagens.js')
 const chatDAO = require('../../../model/DAO/Chat/ChatDAO.js')
 
+const { validarId } = require('../../services/chatValidation.js')
+
 const NOME_MAX = 45
 
-const idValido = (id) => Number.isInteger(id) && id > 0
+const idValido = (id) => Number.isSafeInteger(id) && id > 0
 
 const CriarChat = async (req, res) => {
     try {
-        const id_usuario = Number(req.body?.id_usuario)
-        const nome = String(req.body?.nome ?? '').trim()
+        const id_usuario = validarId(req.body?.id_usuario)
+        const nome = typeof req.body?.nome === 'string' ? req.body.nome.trim() : ''
 
         if (!idValido(id_usuario)) {
             return res.status(config_message.ID_USUARIO_INVALIDO.status)
@@ -25,7 +33,7 @@ const CriarChat = async (req, res) => {
                 .json({ sucesso: false, mensagem: config_message.NOME_CHAT_INVALIDO.mensagem })
         }
 
-        const id = await chatDAO.inssertChat(nome, id_usuario)
+        const id = await chatDAO.insertChat(nome, id_usuario)
 
         if (!id) {
             return res.status(config_message.ERRO_CRIAR_CHAT.status)
@@ -43,7 +51,7 @@ const CriarChat = async (req, res) => {
 
 const ListarChatsPorUsuario = async (req, res) => {
     try {
-        const id_usuario = Number(req.params.id_usuario)
+        const id_usuario = validarId(req.params.id_usuario)
 
         if (!idValido(id_usuario)) {
             return res.status(config_message.ID_USUARIO_INVALIDO.status)
@@ -67,7 +75,7 @@ const ListarChatsPorUsuario = async (req, res) => {
 
 const ListaPorId = async (req, res) => {
     try {
-        const id_chat = Number(req.params.id_chat)
+        const id_chat = validarId(req.params.id_chat)
 
         if (!idValido(id_chat)) {
             return res.status(config_message.ID_CHAT_INVALIDO.status)
@@ -92,8 +100,8 @@ const ListaPorId = async (req, res) => {
 
 const AtualizarNomeChat = async (req, res) => {
     try {
-        const id_chat = Number(req.params.id_chat)
-        const nome = String(req.body?.nome ?? '').trim()
+        const id_chat = validarId(req.params.id_chat)
+        const nome = typeof req.body?.nome === 'string' ? req.body.nome.trim() : ''
 
         if (!idValido(id_chat)) {
             return res.status(config_message.ID_CHAT_INVALIDO.status)
@@ -117,7 +125,10 @@ const AtualizarNomeChat = async (req, res) => {
                 .json({ sucesso: false, mensagem: config_message.CHAT_NAO_ENCONTRADO.mensagem })
         }
 
-        await chatDAO.UpdateChatName(id_chat, nome)
+        if (chat.nome !== nome && !await chatDAO.UpdateChatName(id_chat, nome)) {
+            return res.status(config_message.CHAT_NAO_ENCONTRADO.status)
+                .json({ sucesso: false, mensagem: config_message.CHAT_NAO_ENCONTRADO.mensagem })
+        }
 
         return res.status(config_message.CHAT_ATUALIZADO.status)
             .json({ sucesso: true, mensagem: config_message.CHAT_ATUALIZADO.mensagem })
@@ -130,8 +141,8 @@ const AtualizarNomeChat = async (req, res) => {
 
 const ApagarChat = async (req, res) => {
     try {
-        const id_chat = Number(req.params.id_chat)
-        const id_usuario = Number(req.query?.id_usuario)
+        const id_chat = validarId(req.params.id_chat)
+        const id_usuario = validarId(req.query?.id_usuario)
 
         if (!idValido(id_chat)) {
             return res.status(config_message.ID_CHAT_INVALIDO.status)
@@ -145,12 +156,15 @@ const ApagarChat = async (req, res) => {
 
         const chat = await chatDAO.GetChatById(id_chat)
 
-        if (!chat || chat.id_usuario !== id_usuario) {
+        if (!chat || Number(chat.id_usuario) !== id_usuario) {
             return res.status(config_message.CHAT_NAO_ENCONTRADO.status)
                 .json({ sucesso: false, mensagem: config_message.CHAT_NAO_ENCONTRADO.mensagem })
         }
 
-        await chatDAO.apagarChat(chat.id)
+        if (!await chatDAO.apagarChat(id_chat, id_usuario)) {
+            return res.status(config_message.CHAT_NAO_ENCONTRADO.status)
+                .json({ sucesso: false, mensagem: config_message.CHAT_NAO_ENCONTRADO.mensagem })
+        }
 
         return res.status(config_message.CHAT_DELETADO.status)
             .json({ sucesso: true, mensagem: config_message.CHAT_DELETADO.mensagem })
